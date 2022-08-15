@@ -115,7 +115,7 @@ def create_box_encoder(model_filename, input_name="images",
     return encoder
 
 
-def generate_detections(encoder, mot_dir, output_dir):
+def generate_detections(encoder, mot_dir, output_dir, detection_dir=None):
     """Generate detections with features.
 
     Parameters

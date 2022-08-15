@@ -22,8 +22,7 @@ def extract_patches(image, boxes_scores):
     """
     extract patches from an image with box scores
     """
-    boxes_int = boxes_scores[:4]
-    patches = np.asarray([image[x1:x2, y1:y2] for x1, y1, x2, y2, _ in np.int32(boxes_scores)])
+    patches = np.asarray([image[y1:y2, x1:x2] for y1, x1, y2, x2, _ in np.int32(boxes_scores)])
     return patches
 
 def create_object_detector(model_det):
@@ -59,12 +58,16 @@ def create_custom_detections(image, frame_idx, object_detector, detection_img_tr
 
     boxes_scores = np.concatenate((boxes, scores), axis=1)
 
+    boxes_scores = boxes_scores[boxes_scores[:, 4] >= 0.1]
+
     box_rows, _ = boxes_scores.shape
 
     patches = extract_patches(image, boxes_scores)
 
     boxes_scores[:, 2] = boxes_scores[:, 2] - boxes_scores[:, 0]
     boxes_scores[:, 3] = boxes_scores[:, 3] - boxes_scores[:, 1]
+
+    new_boxes_scores = boxes_scores[:, [1, 0, 3, 2, 4]]
 
     features = np.array([reid_feature_extractor(img).cpu().numpy() for img in patches])
     features = features.reshape(box_rows, features.shape[2])
@@ -73,7 +76,7 @@ def create_custom_detections(image, frame_idx, object_detector, detection_img_tr
         (
             np.repeat(frame_idx, box_rows).reshape(box_rows, 1),
             np.repeat(-1, box_rows).reshape(box_rows, 1),
-            boxes_scores,
+            new_boxes_scores,
             np.repeat(np.array([-1, -1, -1]), box_rows).reshape(box_rows, 3),
             features
         ),
@@ -186,7 +189,7 @@ def create_detections(image, detection_mat, frame_idx, min_height=0, custom_dete
     if custom_detection:
         detection_mat = create_custom_detections(
             image=image,
-            frame_idx=1,
+            frame_idx=frame_idx,
             object_detector=object_detector,
             detection_img_transformer=detection_img_transformer,
             reid_feature_extractor=reid_feature_extractor
