@@ -5,7 +5,7 @@ import argparse
 import numpy as np
 import cv2
 import tensorflow as tf
-
+import tensorflow_hub as hub
 
 def _run_in_batches(f, data_dict, out, batch_size):
     data_len = len(out)
@@ -115,7 +115,7 @@ def create_box_encoder(model_filename, input_name="images",
     return encoder
 
 
-def generate_detections(encoder, mot_dir, output_dir, detection_dir=None):
+def generate_detections(encoder, mot_dir, output_dir):
     """Generate detections with features.
 
     Parameters
@@ -165,6 +165,7 @@ def generate_detections(encoder, mot_dir, output_dir, detection_dir=None):
         for frame_idx in range(min_frame_idx, max_frame_idx + 1):
             print("Frame %05d/%05d" % (frame_idx, max_frame_idx))
             mask = frame_indices == frame_idx
+
             rows = detections_in[mask]
 
             if frame_idx not in image_filenames:

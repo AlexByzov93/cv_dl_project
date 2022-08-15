@@ -12,6 +12,77 @@ from application_util import visualization
 from deep_sort import nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
+from tools import *
+from torchreid.utils.feature_extractor import *
+
+import tensorflow as tf
+import tensorflow_hub as hub
+
+def extract_patches(image, boxes_scores):
+    """
+    extract patches from an image with box scores
+    """
+    boxes_int = boxes_scores[:4]
+    patches = np.asarray([image[x1:x2, y1:y2] for x1, y1, x2, y2, _ in np.int32(boxes_scores)])
+    return patches
+
+def create_object_detector(model_det):
+    """
+    downloads object detector and loads it into a program, creates a specific transformation for images for object detection
+    """
+    object_detector_model = f"https://tfhub.dev/tensorflow/efficientdet/{model_det}/detection/1"
+    object_detector = hub.load(object_detector_model)
+
+    def detection_img_transformer(image):
+        return tf.image.convert_image_dtype(image, tf.uint8)[tf.newaxis, ...]
+
+    return object_detector, detection_img_transformer
+
+def create_reid_extractor(model_reid):
+    """
+    creates feature extractor from image with different models trained for REID task
+    """
+    reid_feature_extractor = FeatureExtractor(model_reid)
+    
+    return reid_feature_extractor
+
+def create_custom_detections(image, frame_idx, object_detector, detection_img_transformer, reid_feature_extractor):
+    """
+    creates a detection_mat np array in a similar to original format where first ten columns are from MOT challenge format and other are for features
+    """
+    det_image = detection_img_transformer(image)
+    boxes, scores, _, _ = object_detector(det_image)
+    boxes = boxes.numpy()
+    boxes = boxes.reshape(boxes.shape[1], boxes.shape[2])
+    scores = scores.numpy()
+    scores = scores.reshape(scores.shape[1], 1)
+
+    boxes_scores = np.concatenate((boxes, scores), axis=1)
+
+    box_rows, _ = boxes_scores.shape
+
+    patches = extract_patches(image, boxes_scores)
+
+    boxes_scores[:, 2] = boxes_scores[:, 2] - boxes_scores[:, 0]
+    boxes_scores[:, 3] = boxes_scores[:, 3] - boxes_scores[:, 1]
+
+    features = np.array([reid_feature_extractor(img).cpu().numpy() for img in patches])
+    features = features.reshape(box_rows, features.shape[2])
+
+    detection_mat = np.concatenate(
+        (
+            np.repeat(frame_idx, box_rows).reshape(box_rows, 1),
+            np.repeat(-1, box_rows).reshape(box_rows, 1),
+            boxes_scores,
+            np.repeat(np.array([-1, -1, -1]), box_rows).reshape(box_rows, 3),
+            features
+        ),
+        axis=1
+    )
+
+    return detection_mat
+
+
 
 def gather_sequence_info(sequence_dir, detection_file):
     """Gather sequence information, such as image filenames, detections,
@@ -91,7 +162,7 @@ def gather_sequence_info(sequence_dir, detection_file):
     }
     return seq_info
 
-def create_detections(detection_mat, frame_idx, min_height=0):
+def create_detections(image, detection_mat, frame_idx, min_height=0, custom_detection=False, object_detector=None, detection_img_transformer=None, reid_feature_extractor=None):
     """Create detections for given frame index from the raw detection matrix.
 
     Parameters
@@ -112,47 +183,38 @@ def create_detections(detection_mat, frame_idx, min_height=0):
         Returns detection responses at given frame index.
 
     """
-    frame_indices = detection_mat[:, 0].astype(np.int)
-    mask = frame_indices == frame_idx
+    if custom_detection:
+        detection_mat = create_custom_detections(
+            image=image,
+            frame_idx=1,
+            object_detector=object_detector,
+            detection_img_transformer=detection_img_transformer,
+            reid_feature_extractor=reid_feature_extractor
+            )
 
-    detection_list = []
-    for row in detection_mat[mask]:
-        bbox, confidence, feature = row[2:6], row[6], row[10:]
-        if bbox[3] < min_height:
-            continue
-        detection_list.append(Detection(bbox, confidence, feature))
+        detection_list = []
+        for row in detection_mat:
+            bbox, confidence, feature = row[2:6], row[6], row[10:]
+            if bbox[3] < min_height:
+                continue
+            detection_list.append(Detection(bbox, confidence, feature))
+        
+    else:
+        frame_indices = detection_mat[:, 0].astype(np.int)
+        mask = frame_indices == frame_idx
+
+        detection_list = []
+        for row in detection_mat[mask]:
+            bbox, confidence, feature = row[2:6], row[6], row[10:]
+            if bbox[3] < min_height:
+                continue
+            detection_list.append(Detection(bbox, confidence, feature))
     return detection_list
 
 def deep_sort_run(sequence_dir, detection_file, output_file, min_confidence,
         nms_max_overlap, min_detection_height, max_cosine_distance,
-        nn_budget, display):
+        nn_budget, display, custom_detection=False, model_det="lite0", model_reid="resnet18"):
     """Run multi-target tracker on a particular sequence.
-
-    Parameters
-    ----------
-    sequence_dir : str
-        Path to the MOTChallenge sequence directory.
-    detection_file : str
-        Path to the detections file.
-    output_file : str
-        Path to the tracking output file. This file will contain the tracking
-        results on completion.
-    min_confidence : float
-        Detection confidence threshold. Disregard all detections that have
-        a confidence lower than this value.
-    nms_max_overlap: float
-        Maximum detection overlap (non-maxima suppression threshold).
-    min_detection_height : int
-        Detection height threshold. Disregard all detections that have
-        a height lower than this value.
-    max_cosine_distance : float
-        Gating threshold for cosine distance metric (object appearance).
-    nn_budget : Optional[int]
-        Maximum size of the appearance descriptor gallery. If None, no budget
-        is enforced.
-    display : bool
-        If True, show visualization of intermediate tracking results.
-
     """
     seq_info = gather_sequence_info(sequence_dir, detection_file)
     metric = nn_matching.NearestNeighborDistanceMetric(
@@ -160,12 +222,20 @@ def deep_sort_run(sequence_dir, detection_file, output_file, min_confidence,
     tracker = Tracker(metric)
     results = []
 
+    if custom_detection:
+        object_detector, detection_img_transformer = create_object_detector(model_det)
+        reid_feature_extractor = create_reid_extractor(model_reid)
+    else:
+        object_detector, detection_img_transformer, reid_feature_extractor = None, None, None
+
+
     def frame_callback(vis, frame_idx):
         print("Processing frame %05d" % frame_idx)
-
+        image = cv2.imread(
+                seq_info["image_filenames"][frame_idx], cv2.IMREAD_COLOR)
         # Load image and generate detections.
-        detections = create_detections(
-            seq_info["detections"], frame_idx, min_detection_height)
+        detections = create_detections(image,
+            seq_info["detections"], frame_idx, min_detection_height, custom_detection, object_detector, detection_img_transformer, reid_feature_extractor)
         detections = [d for d in detections if d.confidence >= min_confidence]
 
         # Run non-maxima suppression.
@@ -181,8 +251,7 @@ def deep_sort_run(sequence_dir, detection_file, output_file, min_confidence,
 
         # Update visualization.
         if display:
-            image = cv2.imread(
-                seq_info["image_filenames"][frame_idx], cv2.IMREAD_COLOR)
+            image = image
             vis.set_image(image.copy())
             vis.draw_detections(detections)
             vis.draw_trackers(tracker.tracks)
